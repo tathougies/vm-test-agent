@@ -1,0 +1,8 @@
+[toolchain]
+channel = "1.89.0"
+components = [
+  "rust-src",
+  "rustfmt",
+  "clippy",
+]
+profile = "default"
