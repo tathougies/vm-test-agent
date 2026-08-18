@@ -22,6 +22,17 @@
               };
               rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           in f system pkgs rust);
+
+        mkPythonPackage = pkgs: pkgs.buildPythonPackage {
+          pname = "vm_test_agent";
+          version = "0.1.0";
+
+          src = ./.;
+
+          pyproject = true;
+
+          build-system = [ pkgs.setuptools ];
+        };
     in {
       packages = forAllSystems (system: pkgs: rust:
         let craneLib = (crane.mkLib pkgs).overrideToolchain rust;
@@ -41,22 +52,21 @@
               inherit cargoArtifacts;
             });
 
-            mkPythonPackage = pkgs: pkgs.buildPythonPackage {
-              pname = "vm_test_agent";
-              version = "0.1.0";
-
-              src = ./.;
-
-              pyproject = true;
-
-              build-system = [ pkgs.setuptools ];
-            };
         in {
           default = package;
           vm-test-agent = package;
 
           python = mkPythonPackage pkgs.python3.pkgs;
         });
+
+      overlays.default = final: prev: {
+        pythonPackagesExtensions = prev.pythonPackagesExtensions ++ [
+          (pyFinal: pyPrev: {
+            vm_test_agent = mkPythonPackage pyFinal;
+          })
+        ];
+      };
+
       devShells = forAllSystems (system: pkgs: rust: {
         default = pkgs.mkShell {
           packages = [
