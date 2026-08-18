@@ -60,6 +60,7 @@
         });
 
       overlays.default = final: prev: {
+        vm-test-agent = self.packages.${final.system}.vm-test-agent;
         pythonPackagesExtensions = prev.pythonPackagesExtensions ++ [
           (pyFinal: pyPrev: {
             vm_test_agent = mkPythonPackage pyFinal;
