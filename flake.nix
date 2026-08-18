@@ -40,8 +40,22 @@
             package = craneLib.buildPackage (commonArgs // {
               inherit cargoArtifacts;
             });
+
+            mkPythonPackage = pkgs: pkgs.buildPythonPackage {
+              pname = "vm_test_agent";
+              version = "0.1.0";
+
+              src = ./.;
+
+              pyproject = true;
+
+              build-system = [ pkgs.setuptools ];
+            };
         in {
           default = package;
+          vm-test-agent = package;
+
+          python = mkPythonPackage pkgs.python3.pkgs;
         });
       devShells = forAllSystems (system: pkgs: rust: {
         default = pkgs.mkShell {
