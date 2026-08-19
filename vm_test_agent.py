@@ -202,6 +202,16 @@ class Command:
     async def wait(self):
         return await self.exit_code
 
+def report_task_result(task: asyncio.Task):
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        log.exception("Background task failed")
+
 class VmTestAgent:
     commands: dict[int, Command]
     stdouts: dict[int, Command]
@@ -229,6 +239,7 @@ class VmTestAgent:
             stream = await klass._open_fd(fd)
         x = klass(stream)
         x.task = asyncio.create_task(x.run())
+        x.task.add_done_callback(report_task_result)
         return x
 
     @classmethod
@@ -282,11 +293,11 @@ class VmTestAgent:
 
 
     async def run(self):
-
         def new_read_task():
             return asyncio.create_task(self.read_stream.readexactly(struct.calcsize('HBB')))
         def new_cmd_task():
             return asyncio.create_task(self.cmdqueue.get())
+
         resp = None
         read_task = new_read_task()
         cmd_task = new_cmd_task()
