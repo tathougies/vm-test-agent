@@ -76,7 +76,7 @@ where
         let m_vsock_num = args.socket.and_then(|x| x.parse::<u32>().ok());
         let port = args.port.unwrap_or(5757);
         if args.serve {
-            let num = m_vsock_num.unwrap_or(tokio_vsock::VMADDR_CID_LOCAL);
+            let num = m_vsock_num.unwrap_or(tokio_vsock::VMADDR_CID_ANY);
             let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(num, port as u32))?;
             return vsock_service(listener, cb).await
         } else if let Some(vsock_num) = m_vsock_num {
