@@ -7,6 +7,9 @@ from enum import Enum
 import os
 import stat
 import struct
+import logging
+
+log = logging.getLogger(__name__)
 
 class Opcode(Enum):
     RUN = 1
@@ -318,6 +321,7 @@ class VmTestAgent:
                         elif not isinstance(pid, IntAttr) or pid.pid not in commands:
                             print(f'Received pid {pid.pid}, but no command corresponds')
                         else:
+                            log.debug("Got output/close for %r", pid.pid)
                             cmd = commands[pid.pid]
                             q = getattr(cmd, queue_attr)
                             if response.code == ResponseCode.OUTPUT:
@@ -342,13 +346,16 @@ class VmTestAgent:
                                 self.commands[pid.pid].exit_code.set_result(code.value)
                     else:
                         assert resp is not None, f"Response was received but no receiver here... {response}"
+                        log.debug("Found response")
                         resp.set_result(response)
                         resp = None
+                        log.debug("Reset cmd task")
                         cmd_task = new_cmd_task()
 
                     read_task = new_read_task()
             if cmd_task in nextstep:
                 cmd, nextresp = cmd_task.result()
+                log.debug("Sending command %r", cmd)
                 self.write_stream.write(cmd)
                 await self.write_stream.drain()
 
