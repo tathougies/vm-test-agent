@@ -187,6 +187,7 @@ impl GenericError {
             stream.write(attr.0.as_bytes()).await?;
             stream.write(&attr.1).await?;
         }
+        stream.flush().await?;
         Ok(())
     }
 }
