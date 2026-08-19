@@ -228,13 +228,13 @@ class VmTestAgent:
         x.task = asyncio.create_task(x.run())
         return x
 
-    @klassmethod
+    @classmethod
     async def _open_vsock(klass, addr: tuple[int, int]):
         s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
         s.connect(addr)
         return await klass._open_socket(klass, s)
 
-    @klassmethod
+    @classmethod
     async def _open_socket_fd(klass, s: socket.socket):
         s.setblocking(False)
         return await asyncio.open_connection(sock=s)
