@@ -285,7 +285,7 @@ class VmTestAgent:
         def new_cmd_task():
             return asyncio.create_task(self.cmdqueue.get())
         resp = None
-        read_task = new_read_task()
+        read_task = [new_read_task()]
         cmd_task = new_cmd_task()
         while True:
             read_command = []
@@ -293,7 +293,7 @@ class VmTestAgent:
                 read_command = [cmd_task]
 
             nextstep, _ = await asyncio.wait([
-                read_task,
+                *read_task,
                 *read_command,
             ], return_when=asyncio.FIRST_COMPLETED)
 
@@ -303,7 +303,7 @@ class VmTestAgent:
                     response = await Response.from_stream(self.read_stream, read_task.result())
                 except asyncio.IncompleteReadError:
                     # Shutting down
-                    read_task = None
+                    return
                 else:
                     if response.code in (ResponseCode.OUTPUT, ResponseCode.CLOSE):
                         # Look up the PID attr
@@ -346,7 +346,7 @@ class VmTestAgent:
                         resp = None
                         cmd_task = new_cmd_task()
 
-                    read_task = new_read_task()
+                    read_task = [new_read_task()]
             if cmd_task in nextstep:
                 cmd, nextresp = cmd_task.result()
                 self.write_stream.write(cmd)
