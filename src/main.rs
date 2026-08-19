@@ -1,22 +1,29 @@
-use std::{collections::HashMap, io, pin::Pin, path::Path};
+use log::{debug, error, info};
+use clap::Parser;
+use core::ops::DerefMut;
 use std::marker::Send;
 use std::os::unix::fs::FileTypeExt;
 use std::sync::Arc;
-use tokio::net::UnixStream;
-use core::ops::DerefMut;
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-use clap::Parser;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use std::{collections::HashMap, io, path::Path, pin::Pin};
 use tokio::fs::OpenOptions;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 #[derive(Parser, Debug)]
 struct Args {
-    socket: String,
+    socket: Option<String>,
 
     #[arg(long)]
-    serve: bool
+    vsock: bool,
+
+    #[arg(long)]
+    serve: bool,
+
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite {}
@@ -25,61 +32,98 @@ type InputStream = Pin<Box<dyn AsyncRead + Send>>;
 type OutputStream = Pin<Box<dyn AsyncWrite + Send>>;
 
 async fn service<Cb, F>(path: &Path, cb: &'static Cb) -> io::Result<()>
+where
+    Cb: Fn(InputStream, OutputStream) -> F,
+    Cb: Sync,
+    F: Future<Output = io::Result<()>> + Send,
+{
+    let server = tokio::net::UnixListener::bind(path)?;
+    loop {
+        let socket = server.accept().await?;
+        info!("Accepted service from {0:?}", socket.1);
+        let (reader, writer) = socket.0.into_split();
+        tokio::spawn(async {
+            if let Err(err) = cb(Box::pin(reader), Box::pin(writer)).await {
+                error!("Service ended: {err}")
+            }
+        });
+    }
+}
+
+async fn vsock_service<Cb, F>(server: tokio_vsock::VsockListener, cb: &'static Cb) -> io::Result<()>
 where Cb: Fn(InputStream, OutputStream) -> F,
       Cb: Sync,
       F: Future<Output = io::Result<()>> + Send {
-    let server = tokio::net::UnixListener::bind(path)?;
     loop {
         let socket = server.accept().await?;
         let (reader, writer) = socket.0.into_split();
         tokio::spawn(async {
             if let Err(err) = cb(Box::pin(reader), Box::pin(writer)).await {
-                println!("Service ended: {err}")
+                error!("VSock service ended: {err}")
             }
         });
     }
 }
 
 async fn open_stream<Cb, F>(args: Args, cb: &'static Cb) -> io::Result<()>
-where F: Future<Output = io::Result<()>> + Send,
-      Cb: Fn(InputStream, OutputStream) -> F,
-      Cb: Sync {
-    let path = Path::new(&args.socket);
-    match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) => {
-            let ty = metadata.file_type();
-
-            if ty.is_socket() {
-                if args.serve  {
-                    std::fs::remove_file(path)?;
-                    service(path, cb).await
-                } else {
-                    let stream = UnixStream::connect(path).await?;
-                    let (reader, writer) = stream.into_split();
-                    cb(Box::pin(reader), Box::pin(writer)).await
-                }
-            } else {
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(path)
-                    .await?;
-                let (reader, writer) = tokio::io::split(file);
-                cb(Box::pin(reader), Box::pin(writer)).await
-            }
-        },
-        Err(e) if e.kind() == io::ErrorKind::NotFound && args.serve =>
-            service(path, cb).await,
-        Err(e) => Err(e)
+where
+    F: Future<Output = io::Result<()>> + Send,
+    Cb: Fn(InputStream, OutputStream) -> F,
+    Cb: Sync,
+{
+    if args.vsock {
+        let m_vsock_num = args.socket.and_then(|x| x.parse::<u32>().ok());
+        let port = args.port.unwrap_or(5757);
+        if args.serve {
+            let num = m_vsock_num.unwrap_or(tokio_vsock::VMADDR_CID_LOCAL);
+            let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(num, port as u32))?;
+            return vsock_service(listener, cb).await
+        } else if let Some(vsock_num) = m_vsock_num {
+            let stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(vsock_num, port as u32)).await?;
+            let (reader, writer) = stream.into_split();
+            return cb(Box::pin(reader), Box::pin(writer)).await
+        } else {
+            panic!("To connect to a vsock, you must provide a socket number. Maybe use --serve");
+        }
     }
+
+    if let Some(socket) = &args.socket {
+        let path = Path::new(socket);
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) => {
+                let ty = metadata.file_type();
+
+                if ty.is_socket() {
+                    if args.serve {
+                        std::fs::remove_file(path)?;
+                        service(path, cb).await?
+                    } else {
+                        let stream = UnixStream::connect(path).await?;
+                        let (reader, writer) = stream.into_split();
+                        cb(Box::pin(reader), Box::pin(writer)).await?
+                    }
+                } else {
+                    let file = OpenOptions::new().read(true).write(true).open(path).await?;
+                    let (reader, writer) = tokio::io::split(file);
+                    cb(Box::pin(reader), Box::pin(writer)).await?
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && args.serve => service(path, cb).await?,
+            Err(e) => return Err(e),
+        }
+
+        return Ok(())
+    }
+
+    panic!("No valid connection method given")
 }
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Opcode {
-    Run = 1,  
+    Run = 1,
     Write = 2,
-    Close = 3
+    Close = 3,
 }
 impl TryFrom<u16> for Opcode {
     type Error = u16;
@@ -105,26 +149,28 @@ enum ResultCode {
     UnknownOp = 6,
     Output = 7,
     Sigchild = 8,
-    Close = 9
+    Close = 9,
 }
 
 #[derive(Debug)]
 struct GenericError {
     result: ResultCode,
-    attrs: Vec<(Attr, Box<[u8]>)>
+    attrs: Vec<(Attr, Box<[u8]>)>,
 }
 
 impl GenericError {
     fn new(result: ResultCode) -> Self {
-        GenericError { result,
-                       attrs: vec!{} }
+        GenericError {
+            result,
+            attrs: vec![],
+        }
     }
 
     fn attr<T: ToAttr + ?Sized>(mut self, name: AttrName, val: &T) -> Self {
         let buf = val.encode_attr();
         let attr = Attr {
             attr: name as u16,
-            len: buf.len() as u16
+            len: buf.len() as u16,
         };
         self.attrs.push((attr, buf));
         self
@@ -133,13 +179,13 @@ impl GenericError {
         let cmd = Command {
             op: self.result as u16,
             num_attrs: self.attrs.len() as u8,
-            padding: 0u8
+            padding: 0u8,
         };
         stream.write(cmd.as_bytes()).await?;
         for attr in self.attrs {
             stream.write(attr.0.as_bytes()).await?;
             stream.write(&attr.1).await?;
-        };
+        }
         Ok(())
     }
 }
@@ -152,7 +198,7 @@ enum AttrName {
     Pid = 3,
     Data = 4,
     Stderr = 5,
-    ExitCode = 6
+    ExitCode = 6,
 }
 impl TryFrom<u16> for AttrName {
     type Error = ();
@@ -180,7 +226,7 @@ struct Command {
 #[derive(Debug, FromBytes, IntoBytes, KnownLayout, Immutable)]
 struct Attr {
     attr: u16,
-    len: u16
+    len: u16,
 }
 
 #[derive(Default)]
@@ -189,18 +235,18 @@ struct RunOp {
 }
 
 enum StreamTarget {
-    PidStream(u32)
+    PidStream(u32),
 }
 
 #[derive(Default)]
 struct WriteOp {
     target: Option<StreamTarget>,
-    buf: Vec<u8>
+    buf: Vec<u8>,
 }
 
 #[derive(Default)]
 struct CloseOp {
-    target: Option<StreamTarget>
+    target: Option<StreamTarget>,
 }
 
 #[derive(Default)]
@@ -229,14 +275,14 @@ async fn read_string(mut n: usize, stream: &mut InputStream) -> io::Result<Strin
 
         match std::str::from_utf8(&buf[..want]) {
             Ok(chunk) => x.push_str(chunk),
-            Err(_) => ()
+            Err(_) => (),
         }
-    };
+    }
 
     Ok(x)
 }
 
-struct Empty{}
+struct Empty {}
 
 trait ToAttr {
     fn encode_attr(&self) -> Box<[u8]>;
@@ -279,24 +325,34 @@ impl ToAttr for [u8] {
 }
 
 trait FromAttrs {
-    async fn set_attr(&mut self, attr: AttrName, len: u16, stream: &mut InputStream) -> io::Result<()>;
+    async fn set_attr(
+        &mut self,
+        attr: AttrName,
+        len: u16,
+        stream: &mut InputStream,
+    ) -> io::Result<()>;
     async fn update_state(self, state: &mut State, stream: &mut OutputStream) -> io::Result<()>;
 }
 
 impl FromAttrs for WriteOp {
-    async fn set_attr(&mut self, attr: AttrName, len: u16, stream: &mut InputStream) -> io::Result<()> {
+    async fn set_attr(
+        &mut self,
+        attr: AttrName,
+        len: u16,
+        stream: &mut InputStream,
+    ) -> io::Result<()> {
         match attr {
             AttrName::Pid => {
                 self.target = Some(StreamTarget::PidStream(stream.read_u32().await?));
-            },
+            }
             AttrName::Data => {
                 let mut buf = Vec::new();
                 buf.resize(len as usize, 0u8);
                 stream.read_exact(buf.as_mut_bytes()).await?;
 
                 self.buf = buf;
-            },
-            _ => ()
+            }
+            _ => (),
         }
         Ok(())
     }
@@ -307,32 +363,35 @@ impl FromAttrs for WriteOp {
             None => {
                 GenericError::new(ResultCode::InvalidState)
                     .attr(AttrName::Message, &"No write target")
-                    .send(stream).await?;
-            },
-            Some(StreamTarget::PidStream(pid)) => {
-                match state.processes.entry(pid) {
-                    Entry::Vacant(_) => {
-                        GenericError::new(ResultCode::NotFound)
-                            .attr(AttrName::Pid, &pid)
-                            .send(stream).await?;
-                    },
-                    Entry::Occupied(mut proc) => {
-                        match proc.get_mut().stdin.write_all(&self.buf).await {
-                            Ok(_) =>
-                                GenericError::new(ResultCode::Success).send(stream).await?,
-                            Err(_) =>
-                                GenericError::new(ResultCode::Failed).send(stream).await?
-                        }
+                    .send(stream)
+                    .await?;
+            }
+            Some(StreamTarget::PidStream(pid)) => match state.processes.entry(pid) {
+                Entry::Vacant(_) => {
+                    GenericError::new(ResultCode::NotFound)
+                        .attr(AttrName::Pid, &pid)
+                        .send(stream)
+                        .await?;
+                }
+                Entry::Occupied(mut proc) => {
+                    match proc.get_mut().stdin.write_all(&self.buf).await {
+                        Ok(_) => GenericError::new(ResultCode::Success).send(stream).await?,
+                        Err(_) => GenericError::new(ResultCode::Failed).send(stream).await?,
                     }
                 }
-            }
+            },
         }
         Ok(())
     }
 }
 
 impl FromAttrs for RunOp {
-    async fn set_attr(&mut self, attr: AttrName, len: u16, stream: &mut InputStream) -> io::Result<()> {
+    async fn set_attr(
+        &mut self,
+        attr: AttrName,
+        len: u16,
+        stream: &mut InputStream,
+    ) -> io::Result<()> {
         self.args.push(read_string(len as usize, stream).await?);
         Ok(())
     }
@@ -340,10 +399,10 @@ impl FromAttrs for RunOp {
         if self.args.is_empty() {
             GenericError::new(ResultCode::InvalidState)
                 .attr(AttrName::Message, &"No arguments given")
-                .send(stream).await?;
+                .send(stream)
+                .await?;
         } else {
-            let mut child =
-                tokio::process::Command::new(self.args[0].clone())
+            let mut child = tokio::process::Command::new(self.args[0].clone())
                 .args(&self.args[1..])
                 .stderr(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -352,14 +411,26 @@ impl FromAttrs for RunOp {
             let stdin = child.stdin.take().unwrap();
             let procstate = Box::new(ProcState::new(stdin));
             let pid = child.id().unwrap();
+            info!("Spawned {0:?} as {1}", self.args, pid);
             GenericError::new(ResultCode::Success)
                 .attr(AttrName::Pid, &pid)
-                .send(stream).await?;
+                .send(stream)
+                .await?;
             let stdout = child.stdout.take().unwrap();
             let stderr = child.stderr.take().unwrap();
             state.processes.insert(pid, procstate);
-            tokio::spawn(output_monitor(Box::pin(stdout), pid, state.queue_writer.clone(), false));
-            tokio::spawn(output_monitor(Box::pin(stderr), pid, state.queue_writer.clone(), true));
+            tokio::spawn(output_monitor(
+                Box::pin(stdout),
+                pid,
+                state.queue_writer.clone(),
+                false,
+            ));
+            tokio::spawn(output_monitor(
+                Box::pin(stderr),
+                pid,
+                state.queue_writer.clone(),
+                true,
+            ));
             tokio::spawn(process_monitor(child, pid, state.queue_writer.clone()));
         }
         Ok(())
@@ -367,18 +438,27 @@ impl FromAttrs for RunOp {
 }
 
 impl FromAttrs for NoOp {
-    async fn set_attr(&mut self, attr: AttrName, len: u16, stream: &mut InputStream) -> io::Result<()> {
+    async fn set_attr(
+        &mut self,
+        attr: AttrName,
+        len: u16,
+        stream: &mut InputStream,
+    ) -> io::Result<()> {
         discard(stream, len as usize).await
     }
 
     async fn update_state(self, state: &mut State, stream: &mut OutputStream) -> io::Result<()> {
         GenericError::new(ResultCode::UnknownOp)
-            .send(stream).await?;
+            .send(stream)
+            .await?;
         Ok(())
     }
 }
 
-async fn parse_attrs<T: FromAttrs + Default>(stream: &mut InputStream, command: &Command) -> io::Result<T> {
+async fn parse_attrs<T: FromAttrs + Default>(
+    stream: &mut InputStream,
+    command: &Command,
+) -> io::Result<T> {
     let mut x = T::default();
 
     for i in 0..command.num_attrs {
@@ -388,7 +468,7 @@ async fn parse_attrs<T: FromAttrs + Default>(stream: &mut InputStream, command: 
 
         match AttrName::try_from(attr.attr) {
             Ok(nm) => x.set_attr(nm, attr.len, stream).await?,
-            Err(_) => discard(stream, attr.len as usize).await?
+            Err(_) => discard(stream, attr.len as usize).await?,
         }
     }
 
@@ -396,7 +476,7 @@ async fn parse_attrs<T: FromAttrs + Default>(stream: &mut InputStream, command: 
 }
 
 struct ProcState {
-    stdin: tokio::process::ChildStdin
+    stdin: tokio::process::ChildStdin,
 }
 
 impl ProcState {
@@ -407,33 +487,47 @@ impl ProcState {
 
 struct State {
     processes: HashMap<u32, Box<ProcState>>,
-    queue_writer: mpsc::Sender<GenericError>
+    queue_writer: mpsc::Sender<GenericError>,
 }
 
 impl State {
     fn new() -> (State, mpsc::Receiver<GenericError>) {
         let (writer, receiver) = mpsc::channel(16);
-        (State { processes: HashMap::new(),
-                 queue_writer: writer },
-         receiver)
+        (
+            State {
+                processes: HashMap::new(),
+                queue_writer: writer,
+            },
+            receiver,
+        )
     }
 }
 
-async fn process_monitor(mut child: tokio::process::Child, pid: u32,
-                         queue: mpsc::Sender<GenericError>) {
+async fn process_monitor(
+    mut child: tokio::process::Child,
+    pid: u32,
+    queue: mpsc::Sender<GenericError>,
+) {
     match child.wait().await {
         Err(x) => println!("Could not wait for {0}: {x}", child.id().unwrap()),
-        Ok(done) => queue.send(GenericError::new(ResultCode::Sigchild)
-                               .attr(AttrName::Pid, &pid)
-                               .attr(AttrName::ExitCode, &done.code().unwrap())).await.unwrap()
+        Ok(done) => queue
+            .send(
+                GenericError::new(ResultCode::Sigchild)
+                    .attr(AttrName::Pid, &pid)
+                    .attr(AttrName::ExitCode, &done.code().unwrap()),
+            )
+            .await
+            .unwrap(),
     }
 }
 
-
-async fn output_monitor(mut stdout: Pin<Box<impl AsyncRead>>, pid: u32,
-                        queue: mpsc::Sender<GenericError>,
-                        is_stderr: bool) {
-    let mut outbuf = [0u8;4096];
+async fn output_monitor(
+    mut stdout: Pin<Box<impl AsyncRead>>,
+    pid: u32,
+    queue: mpsc::Sender<GenericError>,
+    is_stderr: bool,
+) {
+    let mut outbuf = [0u8; 4096];
     loop {
         match stdout.read(&mut outbuf).await {
             Err(x) => println!("Could not read from {pid} (stderr={is_stderr}): {x}"),
@@ -443,15 +537,14 @@ async fn output_monitor(mut stdout: Pin<Box<impl AsyncRead>>, pid: u32,
                     .attr(AttrName::Pid, &pid)
                     .attr(AttrName::Data, &outbuf[..bytes]);
                 if is_stderr {
-                    err = err.attr(AttrName::Stderr, &Empty{});
+                    err = err.attr(AttrName::Stderr, &Empty {});
                 }
                 queue.send(err).await;
-            },
+            }
             Ok(_) => {
-                let mut err = GenericError::new(ResultCode::Close)
-                    .attr(AttrName::Pid, &pid);
+                let mut err = GenericError::new(ResultCode::Close).attr(AttrName::Pid, &pid);
                 if is_stderr {
-                    err = err.attr(AttrName::Stderr, &Empty{});
+                    err = err.attr(AttrName::Stderr, &Empty {});
                 }
                 queue.send(err).await;
                 return;
@@ -460,8 +553,10 @@ async fn output_monitor(mut stdout: Pin<Box<impl AsyncRead>>, pid: u32,
     }
 }
 
-async fn write_half(mut queue: mpsc::Receiver<GenericError>,
-                    mut write_stream: Arc<Mutex<OutputStream>>) {
+async fn write_half(
+    mut queue: mpsc::Receiver<GenericError>,
+    mut write_stream: Arc<Mutex<OutputStream>>,
+) {
     loop {
         let ready = queue.recv().await;
         // Ready is now a
@@ -472,7 +567,7 @@ async fn write_half(mut queue: mpsc::Receiver<GenericError>,
                 let mut stream = write_stream.lock().await;
                 if let Err(x) = pending.send(&mut stream).await {
                     println!("Could not write response: {x:?}");
-                    return
+                    return;
                 }
             }
         }
@@ -488,14 +583,41 @@ async fn serve(mut read_stream: InputStream, write_stream: OutputStream) -> io::
     loop {
         let mut buf = [0u8; std::mem::size_of::<Command>()];
         let recvd = read_stream.read_exact(&mut buf).await?;
-        if recvd == 0 { return Ok(()) }
+        if recvd == 0 {
+            return Ok(());
+        }
         let h = Command::read_from_bytes(&buf).expect("buffer has exactly the right size");
+        debug!("Received command {h:?}");
         let op = Opcode::try_from(h.op);
         match op {
-            Ok(Opcode::Run) => parse_attrs::<RunOp>(&mut read_stream, &h).await?.update_state(&mut state, &mut (write_stream_sync.lock().await.deref_mut())).await?,
-            Ok(Opcode::Write) => parse_attrs::<WriteOp>(&mut read_stream, &h).await?.update_state(&mut state, &mut (write_stream_sync.lock().await.deref_mut())).await?,
+            Ok(Opcode::Run) => {
+                parse_attrs::<RunOp>(&mut read_stream, &h)
+                    .await?
+                    .update_state(
+                        &mut state,
+                        &mut (write_stream_sync.lock().await.deref_mut()),
+                    )
+                    .await?
+            }
+            Ok(Opcode::Write) => {
+                parse_attrs::<WriteOp>(&mut read_stream, &h)
+                    .await?
+                    .update_state(
+                        &mut state,
+                        &mut (write_stream_sync.lock().await.deref_mut()),
+                    )
+                    .await?
+            }
             Ok(Opcode::Close) => todo!("Close"),
-            Err(_) => parse_attrs::<NoOp>(&mut read_stream, &h).await?.update_state(&mut state, &mut (write_stream_sync.lock().await.deref_mut())).await?,
+            Err(_) => {
+                parse_attrs::<NoOp>(&mut read_stream, &h)
+                    .await?
+                    .update_state(
+                        &mut state,
+                        &mut (write_stream_sync.lock().await.deref_mut()),
+                    )
+                    .await?
+            }
         };
     }
 }
@@ -503,5 +625,8 @@ async fn serve(mut read_stream: InputStream, write_stream: OutputStream) -> io::
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    open_stream(args, &serve).await.expect("Could not open stream"); 
+    env_logger::init();
+    open_stream(args, &serve)
+        .await
+        .expect("Could not open stream");
 }

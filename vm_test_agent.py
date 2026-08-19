@@ -1,5 +1,6 @@
 import asyncio
 from typing import Optional, Union, TypeVar, Generic
+import socket
 import typing
 import sys
 from enum import Enum
@@ -215,14 +216,28 @@ class VmTestAgent:
     async def open(klass,
                    filename: Optional[str]=None,
                    fd: Optional[int]=None,
+                   vsock: Optional[tuple[int,int]]=None,
                    stream=None):
-        if filename is not None:
+        if vsock is not None:
+            stream = await klass._open_vsock(vsock)
+        elif filename is not None:
             stream = await klass._open_file(filename)
         elif fd is not None:
             stream = await klass._open_fd(fd)
         x = klass(stream)
         x.task = asyncio.create_task(x.run())
         return x
+
+    @klassmethod
+    async def _open_vsock(klass, addr: tuple[int, int]):
+        s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        s.connect(addr)
+        return await klass._open_socket(klass, s)
+
+    @klassmethod
+    async def _open_socket_fd(klass, s: socket.socket):
+        s.setblocking(False)
+        return await asyncio.open_connection(sock=s)
 
     @staticmethod
     async def _open_file(filename: str):
@@ -369,7 +384,11 @@ async def dump_out(queue, file):
         file.write(buf)
 
 async def go(opts):
-    agent = await VmTestAgent.open(filename=opts.file)
+    if opts.vsock:
+        open_args = dict(vsock=(int(opts.file), opts.port))
+    else:
+        open_args = dict(filename=opts.file)
+    agent = await VmTestAgent.open(**open_args)
     cmd = await agent.run_command(opts.cmd)
 
     asyncio.create_task(dump_out(cmd.out_queue, sys.stdout.buffer))
@@ -384,6 +403,8 @@ if __name__ == "__main__":
                           description="Run commands in a vm-test-agent")
     args.add_argument("file", help="Socket or Chardev to connect to", metavar="SOCK")
     args.add_argument("cmd", help="Command to run", metavar="COMMAND", nargs='+')
+    args.add_argument("--vsock", help="Interpret SOCK as a vsock number", action='store_true', default=False)
+    args.add_argument("--port", help="Port to connect on", type=int, default=5757)
     opts = args.parse_args()
 
     sys.exit(asyncio.run(go(opts)))
