@@ -54,6 +54,7 @@ async fn vsock_service<Cb, F>(server: tokio_vsock::VsockListener, cb: &'static C
 where Cb: Fn(InputStream, OutputStream) -> F,
       Cb: Sync,
       F: Future<Output = io::Result<()>> + Send {
+    info!("Started vsock service at {0}", server.local_addr()?);
     loop {
         let socket = server.accept().await?;
         let (reader, writer) = socket.0.into_split();
