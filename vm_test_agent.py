@@ -299,48 +299,54 @@ class VmTestAgent:
 
 
             if read_task in nextstep:
-                response = await Response.from_stream(self.read_stream, read_task.result())
-                if response.code in (ResponseCode.OUTPUT, ResponseCode.CLOSE):
-                    # Look up the PID attr
-                    commands = self.stdouts
-                    queue_attr = 'out_queue'
-                    if response.find_attr(AttrName.STDERR) is None:
-                        commands = self.stderrs
-                        queue_attr = 'err_queue'
-
-                    if (pid := response.find_attr(AttrName.PID)) is None:
-                        print("Received data without pid")
-                    elif not isinstance(pid, IntAttr) or pid.pid not in commands:
-                        print(f'Received pid {pid.pid}, but no command corresponds')
-                    else:
-                        cmd = commands[pid.pid]
-                        q = getattr(cmd, queue_attr)
-                        if response.code == ResponseCode.OUTPUT:
-                            d = response.find_attr(AttrName.DATA)
-                            if d is None:
-                                print(f'Received output for pid {pid} with no data')
-                            else:
-                                await q.put(d.buf)
-                        else:
-                            await q.put(None)
-
-                elif response.code == ResponseCode.SIGCHILD:
-                    if (pid := response.find_attr(AttrName.PID)) is None:
-                        print("Received SIGCHLD without pid")
-                    elif not isinstance(pid, IntAttr) or pid.pid not in self.commands:
-                        print(f'Received pid {pid.pid}, but no command corresponds')
-                    else:
-                        code = response.find_attr(AttrName.EXIT_CODE)
-                        if not hasattr(code, 'value') or not isinstance(code.value, int):
-                            print(f'Exit code for pid {pid.pid} is malformed')
-                        else:
-                            self.commands[pid.pid].exit_code.set_result(code.value)
+                try:
+                    response = await Response.from_stream(self.read_stream, read_task.result())
+                except asyncio.IncompleteReadError:
+                    # Shutting down
+                    read_task = None
                 else:
-                    assert resp is not None, f"Response was received but no receiver here... {response}"
-                    resp.set_result(response)
-                    resp = None
+                    if response.code in (ResponseCode.OUTPUT, ResponseCode.CLOSE):
+                        # Look up the PID attr
+                        commands = self.stdouts
+                        queue_attr = 'out_queue'
+                        if response.find_attr(AttrName.STDERR) is None:
+                            commands = self.stderrs
+                            queue_attr = 'err_queue'
 
-                read_task = new_read_task()
+                        if (pid := response.find_attr(AttrName.PID)) is None:
+                            print("Received data without pid")
+                        elif not isinstance(pid, IntAttr) or pid.pid not in commands:
+                            print(f'Received pid {pid.pid}, but no command corresponds')
+                        else:
+                            cmd = commands[pid.pid]
+                            q = getattr(cmd, queue_attr)
+                            if response.code == ResponseCode.OUTPUT:
+                                d = response.find_attr(AttrName.DATA)
+                                if d is None:
+                                    print(f'Received output for pid {pid} with no data')
+                                else:
+                                    await q.put(d.buf)
+                            else:
+                                await q.put(None)
+
+                    elif response.code == ResponseCode.SIGCHILD:
+                        if (pid := response.find_attr(AttrName.PID)) is None:
+                            print("Received SIGCHLD without pid")
+                        elif not isinstance(pid, IntAttr) or pid.pid not in self.commands:
+                            print(f'Received pid {pid.pid}, but no command corresponds')
+                        else:
+                            code = response.find_attr(AttrName.EXIT_CODE)
+                            if not hasattr(code, 'value') or not isinstance(code.value, int):
+                                print(f'Exit code for pid {pid.pid} is malformed')
+                            else:
+                                self.commands[pid.pid].exit_code.set_result(code.value)
+                    else:
+                        assert resp is not None, f"Response was received but no receiver here... {response}"
+                        resp.set_result(response)
+                        resp = None
+                        cmd_task = new_cmd_task()
+
+                    read_task = new_read_task()
             if cmd_task in nextstep:
                 cmd, nextresp = cmd_task.result()
                 self.write_stream.write(cmd)
@@ -349,7 +355,7 @@ class VmTestAgent:
                 if nextresp is not None:
                     assert resp is None, 'We are reading the command queue despite having an outstanding command'
                     resp = nextresp
-                cmd_task = new_cmd_task()
+                cmd_task = None
 
     async def run_command(self, args: Union[str, list[str]],
                            env: Optional[dict[str, str]] = None):
@@ -393,6 +399,11 @@ async def go(opts):
     else:
         open_args = dict(filename=opts.file)
     agent = await VmTestAgent.open(**open_args)
+    cmd = await agent.run_command(opts.cmd)
+
+    asyncio.create_task(dump_out(cmd.out_queue, sys.stdout.buffer))
+    asyncio.create_task(dump_out(cmd.err_queue, sys.stderr.buffer))
+    code = await cmd.wait()
     cmd = await agent.run_command(opts.cmd)
 
     asyncio.create_task(dump_out(cmd.out_queue, sys.stdout.buffer))
