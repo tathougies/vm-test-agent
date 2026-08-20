@@ -275,7 +275,7 @@ class QueueReader:
         return await self.readuntil(b'\n')
 
     async def readuntil(self, separator=b'\n'):
-        buf = b''
+        buf = self.buf
         while (i := buf.find(separator)) == -1:
             chunk = await self.read(4096)
             if len(chunk) == 0:
@@ -284,7 +284,7 @@ class QueueReader:
 
         i += 1
         line = buf[:i]
-        self.buf = buf[i:] + self.buf
+        self.buf = buf[i:]
         return line
 
     async def readexactly(self, n):
