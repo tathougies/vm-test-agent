@@ -472,7 +472,6 @@ class VmTestAgent:
         return self.stream[0]
 
     async def close(self):
-        await self.read_stream.close()
         await self.write_stream.close()
 
 async def dump_out(queue, file):
