@@ -322,8 +322,6 @@ class VmTestAgent:
         x = klass(stream)
         x.read_task = asyncio.create_task(x.run_read())
         x.write_task = asyncio.create_task(x.run_write())
-        x.read_task.add_done_callback(report_task_result)
-        x.write_task.add_done_callback(report_task_result)
         x.resp = None
         return x
 
