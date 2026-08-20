@@ -474,6 +474,12 @@ class VmTestAgent:
     async def close(self):
         self.write_stream.close()
 
+        self.write_task.cancel()
+        self.read_task.cancel()
+
+        await self.write_task
+        await self.read_task
+
 async def dump_out(queue, file):
     while True:
         buf = await queue.get()
