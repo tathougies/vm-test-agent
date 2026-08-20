@@ -272,7 +272,7 @@ class QueueReader:
         return buf
 
     async def readline(self):
-        return self.readuntil(b'\n')
+        return await self.readuntil(b'\n')
 
     async def readuntil(self, separator=b'\n'):
         buf = b''
