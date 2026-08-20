@@ -1,5 +1,6 @@
 import asyncio
 from typing import Optional, Union, TypeVar, Generic
+from functools import cached_property
 import socket
 import typing
 import sys
@@ -202,6 +203,15 @@ class Command:
     async def wait(self):
         return await self.exit_code
 
+    @cached_property
+    def stdout(self):
+        return QueueReader(self.out_queue)
+
+
+    @cached_property
+    def stderr(self):
+        return QueueReader(self.err_queue)
+
 def report_task_result(task: asyncio.Task):
     try:
         task.result()
@@ -211,6 +221,78 @@ def report_task_result(task: asyncio.Task):
         import traceback
         traceback.print_exc()
         log.exception("Background task failed")
+    log.debug("Background task exits")
+
+class QueueReader:
+    '''Transform a asyncio.Queue of bytes chunks into a reader'''
+
+    def __init__(self, q):
+        self.queue = q
+        self.buf = b''
+        self.eof = False
+
+    def at_eof(self):
+        return self.eof
+
+    async def read(self, n=-1):
+        if n == 0 or self.eof: return b''
+        elif n > 0:
+            if len(self.buf) > n:
+                r = self.buf[:n]
+                self.buf = self.buf[n:]
+                return r
+            else:
+                buf = self.buf
+                n -= len(buf)
+        else:
+            buf = self.buf
+
+        while n != 0:
+            try:
+                if len(buf) == 0 or n < 0: # If n < 0, then wait no matter what
+                    next = await self.queue.get()
+                else:
+                    next = self.queue.get_nowait() # If we already have one byte, just be greedy, but don't stall
+            except (asyncio.QueueEmpty, asyncio.QueueShutdown):
+                break
+
+            if next is None:
+                self.eof = True
+                break
+
+            if n > 0 and len(next) > n:
+                buf += next[:n]
+                self.buf = next[n:]
+                n = 0
+                break
+            else:
+                buf += next
+                n -= len(next)
+
+        return buf
+
+    async def readline(self):
+        return self.readuntil(b'\n')
+
+    async def readuntil(self, separator=b'\n'):
+        buf = b''
+        while (i := buf.find(separator)) == -1:
+            chunk = await self.read(4096)
+            if len(chunk) == 0:
+                break
+            buf += chunk
+
+        i += 1
+        line = buf[:i]
+        self.buf = buf[i:] + self.buf
+        return line
+
+    async def readexactly(self, n):
+        buf = b''
+        while n > 0:
+            buf += await self.read(n)
+            n -= len(buf)
+        return buf
 
 class VmTestAgent:
     commands: dict[int, Command]
@@ -238,8 +320,11 @@ class VmTestAgent:
         elif fd is not None:
             stream = await klass._open_fd(fd)
         x = klass(stream)
-        x.task = asyncio.create_task(x.run())
-        x.task.add_done_callback(report_task_result)
+        x.read_task = asyncio.create_task(x.run_read())
+        x.write_task = asyncio.create_task(x.run_write())
+        x.read_task.add_done_callback(report_task_result)
+        x.write_task.add_done_callback(report_task_result)
+        x.resp = None
         return x
 
     @classmethod
@@ -291,89 +376,73 @@ class VmTestAgent:
 
         return reader, writer
 
-
-    async def run(self):
-        def new_read_task():
-            return asyncio.create_task(self.read_stream.readexactly(struct.calcsize('HBB')))
-        def new_cmd_task():
-            return asyncio.create_task(self.cmdqueue.get())
-
-        resp = None
-        read_task = new_read_task()
-        cmd_task = new_cmd_task()
+    async def run_write(self):
+        self.resp = None
         while True:
-            read_command = []
-            if resp is None:
-                read_command = [cmd_task]
+            #print("WAIT CMD QUEUE", self.cmdqueue, id(self.cmdqueue), id(asyncio.get_running_loop()))
+            cmd, nextresp = await self.cmdqueue.get()
+            #print("GOT CMD", cmd)
+            log.debug("Sending command %r", cmd)
+            self.write_stream.write(cmd)
+            await self.write_stream.drain()
 
-            nextstep, _ = await asyncio.wait([
-                read_task,
-                *read_command,
-            ], return_when=asyncio.FIRST_COMPLETED)
+            if nextresp is not None:
+                assert self.resp is None, 'We are reading the command queue despite having an outstanding command'
+                self.resp = nextresp
 
+    async def run_read(self):
+        resp = None
+        while True:
+            try:
+                buf = await self.read_stream.readexactly(struct.calcsize('HBB'))
+                response = await Response.from_stream(self.read_stream, buf)
+            except asyncio.IncompleteReadError:
+                # Shutting down
+                return
+            else:
+                if response.code in (ResponseCode.OUTPUT, ResponseCode.CLOSE):
+                    # Look up the PID attr
+                    commands = self.stdouts
+                    queue_attr = 'out_queue'
+                    if response.find_attr(AttrName.STDERR) is not None:
+                        commands = self.stderrs
+                        queue_attr = 'err_queue'
 
-            if read_task in nextstep:
-                try:
-                    response = await Response.from_stream(self.read_stream, read_task.result())
-                except asyncio.IncompleteReadError:
-                    # Shutting down
-                    return
-                else:
-                    if response.code in (ResponseCode.OUTPUT, ResponseCode.CLOSE):
-                        # Look up the PID attr
-                        commands = self.stdouts
-                        queue_attr = 'out_queue'
-                        if response.find_attr(AttrName.STDERR) is None:
-                            commands = self.stderrs
-                            queue_attr = 'err_queue'
-
-                        if (pid := response.find_attr(AttrName.PID)) is None:
-                            print("Received data without pid")
-                        elif not isinstance(pid, IntAttr) or pid.pid not in commands:
-                            print(f'Received pid {pid.pid}, but no command corresponds')
-                        else:
-                            log.debug("Got output/close for %r", pid.pid)
-                            cmd = commands[pid.pid]
-                            q = getattr(cmd, queue_attr)
-                            if response.code == ResponseCode.OUTPUT:
-                                d = response.find_attr(AttrName.DATA)
-                                if d is None:
-                                    print(f'Received output for pid {pid} with no data')
-                                else:
-                                    await q.put(d.buf)
-                            else:
-                                await q.put(None)
-
-                    elif response.code == ResponseCode.SIGCHILD:
-                        if (pid := response.find_attr(AttrName.PID)) is None:
-                            print("Received SIGCHLD without pid")
-                        elif not isinstance(pid, IntAttr) or pid.pid not in self.commands:
-                            print(f'Received pid {pid.pid}, but no command corresponds')
-                        else:
-                            code = response.find_attr(AttrName.EXIT_CODE)
-                            if not hasattr(code, 'value') or not isinstance(code.value, int):
-                                print(f'Exit code for pid {pid.pid} is malformed')
-                            else:
-                                self.commands[pid.pid].exit_code.set_result(code.value)
+                    if (pid := response.find_attr(AttrName.PID)) is None:
+                        print("Received data without pid")
+                    elif not isinstance(pid, IntAttr) or pid.pid not in commands:
+                        print(f'Received pid {pid.pid}, but no command corresponds')
                     else:
-                        assert resp is not None, f"Response was received but no receiver here... {response}"
-                        log.debug("Found response")
-                        resp.set_result(response)
-                        resp = None
-                        log.debug("Reset cmd task")
-                        cmd_task = new_cmd_task()
+                        log.debug("Got %r for %r (queue=%r)", response.code, pid.pid, queue_attr)
+                        cmd = commands[pid.pid]
+                        q = getattr(cmd, queue_attr)
+                        if response.code == ResponseCode.OUTPUT:
+                            d = response.find_attr(AttrName.DATA)
+                            log.debug("Write data %r", d)
+                            if d is None:
+                                print(f'Received output for pid {pid} with no data')
+                            else:
+                                await q.put(d.buf)
+                        else:
+                            await q.put(None)
 
-                    read_task = new_read_task()
-            if cmd_task in nextstep:
-                cmd, nextresp = cmd_task.result()
-                log.debug("Sending command %r", cmd)
-                self.write_stream.write(cmd)
-                await self.write_stream.drain()
-
-                if nextresp is not None:
-                    assert resp is None, 'We are reading the command queue despite having an outstanding command'
-                    resp = nextresp
-                cmd_task = None
+                elif response.code == ResponseCode.SIGCHILD:
+                    if (pid := response.find_attr(AttrName.PID)) is None:
+                        print("Received SIGCHLD without pid")
+                    elif not isinstance(pid, IntAttr) or pid.pid not in self.commands:
+                        print(f'Received pid {pid.pid}, but no command corresponds')
+                    else:
+                        code = response.find_attr(AttrName.EXIT_CODE)
+                        if not hasattr(code, 'value') or not isinstance(code.value, int):
+                            print(f'Exit code for pid {pid.pid} is malformed')
+                        else:
+                            self.commands[pid.pid].exit_code.set_result(code.value)
+                else:
+                    assert self.resp is not None, f"Response was received but no receiver here... {response}"
+                    log.debug("Found response")
+                    self.resp.set_result(response)
+                    self.resp = None
+                    log.debug("Reset cmd task")
 
     async def run_command(self, args: Union[str, list[str]],
                            env: Optional[dict[str, str]] = None):
@@ -382,7 +451,9 @@ class VmTestAgent:
                 .encode_message()
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
+        #print("QUEUE CMD", self.cmdqueue, id(self.cmdqueue), id(asyncio.get_running_loop()))
         await self.cmdqueue.put((msg, fut))
+        #print("NOW WAIT")
         resp = await fut
         resp.throw()
 
