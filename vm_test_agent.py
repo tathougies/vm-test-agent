@@ -493,11 +493,6 @@ async def go(opts):
     asyncio.create_task(dump_out(cmd.out_queue, sys.stdout.buffer))
     asyncio.create_task(dump_out(cmd.err_queue, sys.stderr.buffer))
     code = await cmd.wait()
-    cmd = await agent.run_command(opts.cmd)
-
-    asyncio.create_task(dump_out(cmd.out_queue, sys.stdout.buffer))
-    asyncio.create_task(dump_out(cmd.err_queue, sys.stderr.buffer))
-    code = await cmd.wait()
 
     return code
 
