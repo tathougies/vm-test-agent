@@ -253,7 +253,7 @@ class QueueReader:
                     next = await self.queue.get()
                 else:
                     next = self.queue.get_nowait() # If we already have one byte, just be greedy, but don't stall
-            except (asyncio.QueueEmpty, asyncio.QueueShutdown):
+            except (asyncio.QueueEmpty, asyncio.QueueShutDown):
                 break
 
             if next is None:
